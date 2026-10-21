@@ -1,0 +1,120 @@
+# Compile/lint/test the private fireunix-app/shadow-srelay source.
+#
+# This repository is PUBLIC: the source is checked out at run time with a
+# read-only deploy key. Logs may show the few lines around a compiler error,
+# but never whole files: each step's output is capped, rustfmt reports only
+# file names, passing tests are not listed, backtraces are off and nothing is
+# uploaded as an artifact.
+name: CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch of fireunix-app/shadow-srelay"
+        required: true
+        default: main
+      run_tests:
+        description: "Run cargo test"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ inputs.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: never
+      # Debuginfo off: faster compile/link and smaller caches.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      RUST_BACKTRACE: "0"
+    defaults:
+      run:
+        working-directory: shadow-srelay
+    steps:
+      - name: Check out private source
+        uses: actions/checkout@v4
+        with:
+          repository: fireunix-app/shadow-srelay
+          ref: ${{ inputs.ref }}
+          path: shadow-srelay
+          ssh-key: ${{ secrets.SRELAY_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Set up mold linker
+        uses: rui314/setup-mold@v1
+
+      - name: Restore dependency cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: shadow-srelay -> target
+
+      # rust-cache keeps only third-party dependencies; the private crates are
+      # rebuilt every run. Their incremental state is cached separately, per
+      # private branch, falling back to the newest state of any branch.
+      - name: Restore incremental cache
+        uses: actions/cache/restore@v4
+        with:
+          path: shadow-srelay/target/debug/incremental
+          key: incr-${{ runner.os }}-${{ inputs.ref }}-${{ github.run_id }}
+          restore-keys: |
+            incr-${{ runner.os }}-${{ inputs.ref }}-
+            incr-${{ runner.os }}-
+
+      - name: Install log limiter
+        working-directory: .
+        run: |
+          # Diagnostics may quote the lines around an error, which is allowed,
+          # but a flood of errors must not dump large parts of the source:
+          # cap each step's output and report how much was cut.
+          sudo tee /usr/local/bin/cap >/dev/null <<'SH'
+          #!/bin/sh
+          exec awk -v max=1500 'NR<=max { print; next } { cut++ } END { if (cut) printf "... output truncated: %d more lines not shown\n", cut }'
+          SH
+          sudo chmod +x /usr/local/bin/cap
+
+      - name: rustfmt (file names only)
+        run: |
+          cargo fmt --all
+          if ! git diff --quiet; then
+            echo "::error::rustfmt would change these files:"
+            git diff --name-only
+            exit 1
+          fi
+
+      - name: clippy
+        if: ${{ !cancelled() }}
+        env:
+          # Step-level so it wins over rust-cache, which exports CARGO_INCREMENTAL=0.
+          CARGO_INCREMENTAL: "1"
+        run: |
+          set -o pipefail
+          cargo clippy --locked --all-targets -- -D warnings 2>&1 | cap
+
+      - name: test
+        if: ${{ !cancelled() && inputs.run_tests }}
+        env:
+          # Step-level so it wins over rust-cache, which exports CARGO_INCREMENTAL=0.
+          CARGO_INCREMENTAL: "1"
+        run: |
+          set -o pipefail
+          cargo test --locked --no-fail-fast --quiet 2>&1 | cap
+
+      - name: Save incremental cache
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@v4
+        with:
+          path: shadow-srelay/target/debug/incremental
+          key: incr-${{ runner.os }}-${{ inputs.ref }}-${{ github.run_id }}
